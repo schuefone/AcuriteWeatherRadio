@@ -12,11 +12,15 @@ if [[ ! -d "$SITE_DIR/.git" ]]; then
   exit 2
 fi
 
+pushd "$ROOT_DIR" > /dev/null
+
 python -m acurite_logger.site_builder \
   --db-path "$DB_PATH" \
   --site-dir "$SITE_DIR" \
   --title "$TITLE" \
   --station-label "$STATION_LABEL"
+
+popd > /dev/null
 
 pushd "$SITE_DIR" > /dev/null
 
