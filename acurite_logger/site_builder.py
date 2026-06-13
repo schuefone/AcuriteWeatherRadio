@@ -4,9 +4,13 @@ import argparse
 import json
 import sqlite3
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from html import escape
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+
+PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
 
 
 @dataclass
@@ -109,9 +113,19 @@ def _parse_time(value: object) -> datetime | None:
     if not isinstance(value, str):
         return None
     try:
-        return datetime.fromisoformat(value)
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            # rtl_433 in this project is configured for UTC timestamps.
+            return parsed.replace(tzinfo=UTC)
+        return parsed
     except ValueError:
         return None
+
+
+def _format_pacific(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    return value.astimezone(PACIFIC_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
 def _fmt_number(value: float | None, digits: int = 1) -> str:
@@ -153,7 +167,7 @@ def _snapshot(conn: sqlite3.Connection) -> WeatherSnapshot:
     wind_dir_row = _query_latest_non_null(conn, "wind_dir_deg")
     rain_row = _query_latest_non_null(conn, "rain_in") or _query_latest_non_null(conn, "rain_mm")
 
-    generated = datetime.now().replace(microsecond=0).isoformat()
+    generated = _format_pacific(datetime.now(tz=UTC).replace(microsecond=0)) or "--"
 
     if latest is None:
         return WeatherSnapshot(
@@ -175,16 +189,17 @@ def _snapshot(conn: sqlite3.Connection) -> WeatherSnapshot:
             stale_minutes=None,
         )
 
-    observed_at = latest["observed_at"]
-    observed_ts = _parse_time(observed_at)
+    observed_at_raw = latest["observed_at"]
+    observed_ts = _parse_time(observed_at_raw)
+    observed_at_display = _format_pacific(observed_ts)
     stale_minutes: int | None = None
     if observed_ts is not None:
-        delta = datetime.now() - observed_ts
+        delta = datetime.now(tz=UTC) - observed_ts.astimezone(UTC)
         stale_minutes = max(0, int(delta.total_seconds() // 60))
 
     return WeatherSnapshot(
         generated_at=generated,
-        observed_at=str(observed_at) if observed_at is not None else None,
+        observed_at=observed_at_display,
         model=str(latest["model"]) if latest["model"] is not None else None,
         sensor_id=str(latest["sensor_id"]) if latest["sensor_id"] is not None else None,
         channel=str(latest["channel"]) if latest["channel"] is not None else None,
@@ -240,7 +255,9 @@ def _recent_rows(conn: sqlite3.Connection, max_rows: int) -> list[dict[str, obje
         if key in seen:
             continue
         seen.add(key)
-        deduped.append(dict(row))
+        row_dict = dict(row)
+        row_dict["observed_at"] = _format_pacific(_parse_time(row_dict.get("observed_at")))
+        deduped.append(row_dict)
         if len(deduped) >= max_rows:
             break
     return deduped
