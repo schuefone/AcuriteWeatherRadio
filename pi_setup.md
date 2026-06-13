@@ -1,23 +1,30 @@
-# Raspberry Pi Setup And Test Guide
+# Raspberry Pi Rebuild Setup Guide
 
-This guide walks through installing Miniconda on a Raspberry Pi, pulling this project from GitHub, creating the Conda environment named weather, and running a live test of the weather logger.
+This is the full rebuild checklist for a clean Raspberry Pi OS install.
+
+It covers:
+
+1. weather logger setup (`AcuriteWeatherRadio`)
+2. static web publish setup (`PleasantStreetWeather`)
+3. GitHub Pages and Git auth configuration
+4. automatic startup on reboot using `systemd`
+5. SDR driver conflict fixes (`usb_claim_interface error -6`)
+
+## Expected Folder Layout
+
+```text
+/home/schuelaw/GitHub/AcuriteWeatherRadio
+/home/schuelaw/GitHub/PleasantStreetWeather
+```
 
 ## 1. Install Required OS Packages
-
-Run:
 
 ```bash
 sudo apt update
 sudo apt install -y git wget bzip2 libusb-1.0-0 rtl-433 rtl-sdr sqlite3
 ```
 
-What these are for:
-- git: clone and update this repository.
-- rtl-433: decodes weather sensor RF packets.
-- rtl-sdr: SDR diagnostics and utilities.
-- sqlite3: quick database inspection.
-
-## 2. Install Miniconda On Raspberry Pi
+## 2. Install Miniconda
 
 Check architecture:
 
@@ -25,7 +32,7 @@ Check architecture:
 uname -m
 ```
 
-If the output is aarch64, install Miniconda:
+If architecture is `aarch64`:
 
 ```bash
 wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-aarch64.sh -O ~/miniconda.sh
@@ -41,107 +48,257 @@ Verify:
 conda --version
 ```
 
-## 3. Pull The Code From GitHub
-
-Clone for first-time setup:
+## 3. Clone Both Repositories
 
 ```bash
-git clone <your-github-url>
-cd AcuriteWeatherRadio
+mkdir -p /home/schuelaw/GitHub
+cd /home/schuelaw/GitHub
+git clone git@github.com:schuefone/AcuriteWeatherRadio.git
+git clone git@github.com:schuefone/PleasantStreetWeather.git
 ```
 
-If the repo already exists locally:
+If already cloned:
 
 ```bash
-cd ~/GitHub/AcuriteWeatherRadio
+cd /home/schuelaw/GitHub/AcuriteWeatherRadio
+git pull
+cd /home/schuelaw/GitHub/PleasantStreetWeather
 git pull
 ```
 
-## 4. Create Conda Environment weather
-
-From the repository root:
+## 4. Create Conda Environment `weather`
 
 ```bash
+cd /home/schuelaw/GitHub/AcuriteWeatherRadio
 conda env create -n weather -f environment.yml
 conda activate weather
 ```
 
-If the environment already exists:
+If env already exists:
 
 ```bash
 conda env update -n weather -f environment.yml --prune
 conda activate weather
 ```
 
-Smoke test the Python entrypoint:
+Smoke test:
 
 ```bash
 python -m acurite_logger --help
+python -m acurite_logger.site_builder --help
 ```
 
-## 5. Confirm SDR Reception Before Running Logger
+## 5. Configure GitHub Pages
 
-With the SDR receiver plugged in:
+In the `PleasantStreetWeather` GitHub repo settings:
+
+1. Source: `Deploy from a branch`
+2. Branch: `main`
+3. Folder: `/(root)`
+
+## 6. Configure Git Auth For Unattended Pushes
+
+Use a deploy key scoped to `PleasantStreetWeather`.
+
+Generate key on Pi (blank passphrase):
+
+```bash
+ssh-keygen -t ed25519 -C "pi-weather-deploy" -f ~/.ssh/pleasant_street_deploy
+cat ~/.ssh/pleasant_street_deploy.pub
+```
+
+Add this public key at:
+
+1. `PleasantStreetWeather` repo
+2. Settings -> Deploy keys
+3. Check `Allow write access`
+
+Create SSH host alias:
+
+```bash
+cat >> ~/.ssh/config << 'EOF'
+Host github-pleasant-street
+    HostName github.com
+    User git
+    IdentityFile ~/.ssh/pleasant_street_deploy
+EOF
+chmod 600 ~/.ssh/config
+```
+
+Set `PleasantStreetWeather` remote to alias:
+
+```bash
+cd /home/schuelaw/GitHub/PleasantStreetWeather
+git remote set-url origin git@github-pleasant-street:schuefone/PleasantStreetWeather.git
+ssh -T git@github-pleasant-street
+```
+
+Set Git commit identity on Pi:
+
+```bash
+git config --global user.name "Albert Schuelaw"
+git config --global user.email "schuelaw@whitman.edu"
+```
+
+## 7. First Logger Run And Data Check
+
+Quick RF test:
 
 ```bash
 rtl_433 -d 0 -f 433920000 -M time:iso:utc -F json -T 30
 ```
 
-You should see JSON lines from Acurite bursts.
-
-Optional SDR hardware check:
+Run logger:
 
 ```bash
-rtl_test -t
-```
-
-## 6. Run The Python Weather Logger
-
-Recommended command (SQLite + CSV):
-
-```bash
+cd /home/schuelaw/GitHub/AcuriteWeatherRadio
+mkdir -p data logs
 python -m acurite_logger --rtl433-path rtl_433 --db-path data/weather.db --csv-path logs/weather.csv
 ```
 
-SQLite only:
+Check database:
 
 ```bash
-python -m acurite_logger --rtl433-path rtl_433 --db-path data/weather.db
+sqlite3 /home/schuelaw/GitHub/AcuriteWeatherRadio/data/weather.db ".tables"
+sqlite3 /home/schuelaw/GitHub/AcuriteWeatherRadio/data/weather.db "select observed_at, model, temperature_f, humidity, wind_avg_mi_h, rain_in from weather_observations order by id desc limit 10;"
 ```
 
-Short timed test (2 minutes):
+## 8. First Static Publish Test
 
 ```bash
-python -m acurite_logger --rtl433-path rtl_433 --db-path data/weather.db --csv-path logs/weather.csv --extra-arg=-T --extra-arg=120
+cd /home/schuelaw/GitHub/AcuriteWeatherRadio
+chmod +x scripts/publish_static_weather.sh
+./scripts/publish_static_weather.sh
 ```
 
-Notes:
-- db-path is where the SQLite file is written.
-- csv-path is optional. Omit it to disable CSV output.
-- Parent directories are created automatically.
-
-## 7. Verify Logged Data
-
-Check latest rows in SQLite:
+Check web repo:
 
 ```bash
-sqlite3 data/weather.db "select observed_at, model, sensor_id, temperature_f, humidity, wind_avg_mi_h, wind_dir_deg, rain_in, battery_ok from weather_observations order by id desc limit 10;"
+cd /home/schuelaw/GitHub/PleasantStreetWeather
+git log -1 --oneline
+ls -l index.html data.json
 ```
 
-Check the CSV file:
+Live URL:
+
+```text
+https://schuefone.github.io/PleasantStreetWeather/
+```
+
+## 9. Auto-Start On Reboot (Systemd)
+
+Create logger service:
 
 ```bash
-tail -n 10 logs/weather.csv
+sudo tee /etc/systemd/system/acurite-logger.service >/dev/null <<'EOF'
+[Unit]
+Description=Acurite RTL433 Logger
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=schuelaw
+WorkingDirectory=/home/schuelaw/GitHub/AcuriteWeatherRadio
+Environment=PATH=/home/schuelaw/miniconda3/envs/weather/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/home/schuelaw/miniconda3/envs/weather/bin/python -m acurite_logger --rtl433-path rtl_433 --db-path /home/schuelaw/GitHub/AcuriteWeatherRadio/data/weather.db --csv-path /home/schuelaw/GitHub/AcuriteWeatherRadio/logs/weather.csv
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
 ```
 
-## 8. Troubleshooting
+Create publish one-shot service:
 
-- Command not found for conda:
-  - Open a new shell or run source ~/.bashrc.
-- Command not found for rtl_433:
-  - Ensure rtl-433 package installed: sudo apt install -y rtl-433.
-- No data appears:
-  - Run rtl_test -t to confirm SDR visibility.
-  - Reposition antenna and wait through several transmit cycles.
-- Duplicate rows in short bursts:
-  - Normal behavior. Acurite sensors often repeat transmissions with sequence numbers.
+```bash
+sudo tee /etc/systemd/system/weather-publish.service >/dev/null <<'EOF'
+[Unit]
+Description=Publish static weather page to GitHub
+
+[Service]
+Type=oneshot
+User=schuelaw
+WorkingDirectory=/home/schuelaw/GitHub/AcuriteWeatherRadio
+Environment=PATH=/home/schuelaw/miniconda3/envs/weather/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/bin/bash /home/schuelaw/GitHub/AcuriteWeatherRadio/scripts/publish_static_weather.sh
+EOF
+```
+
+Create publish timer (every 5 min):
+
+```bash
+sudo tee /etc/systemd/system/weather-publish.timer >/dev/null <<'EOF'
+[Unit]
+Description=Run weather publish every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=weather-publish.service
+
+[Install]
+WantedBy=timers.target
+EOF
+```
+
+Enable and start:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now acurite-logger.service
+sudo systemctl enable --now weather-publish.timer
+```
+
+Status checks:
+
+```bash
+systemctl is-enabled acurite-logger.service
+systemctl status acurite-logger.service --no-pager
+systemctl status weather-publish.timer --no-pager
+journalctl -u acurite-logger.service -n 50 --no-pager
+journalctl -u weather-publish.service -n 50 --no-pager
+```
+
+## 10. SDR Claim Conflict Fix (`usb_claim_interface error -6`)
+
+Blacklist conflicting DVB modules:
+
+```bash
+sudo tee /etc/modprobe.d/blacklist-rtl-sdr.conf >/dev/null <<'EOF'
+blacklist dvb_usb_rtl28xxu
+blacklist rtl2832_sdr
+blacklist rtl2830
+EOF
+sudo update-initramfs -u
+sudo reboot
+```
+
+After reboot, verify blacklist worked:
+
+```bash
+lsmod | grep -E "dvb_usb_rtl28xxu|rtl2832_sdr|rtl2830"
+```
+
+Expected: no output.
+
+If the logger still fails after reboot, run:
+
+```bash
+sudo systemctl stop acurite-logger.service
+sudo modprobe -r dvb_usb_rtl28xxu rtl2832_sdr rtl2830 dvb_usb_v2 dvb_core
+sudo systemctl start acurite-logger.service
+```
+
+## 11. Rebuild Verification Checklist
+
+After any OS reinstall, verify these in order:
+
+1. `conda activate weather` works.
+2. `python -m acurite_logger --help` works.
+3. `acurite-logger.service` is `enabled` and `active`.
+4. `weather-publish.timer` is `enabled` and `active`.
+5. `./scripts/publish_static_weather.sh` pushes successfully.
+6. live page loads at `https://schuefone.github.io/PleasantStreetWeather/`.
