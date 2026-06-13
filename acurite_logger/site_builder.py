@@ -27,6 +27,8 @@ class WeatherSnapshot:
     wind_avg_mi_h: float | None
     wind_avg_km_h: float | None
     wind_dir_deg: float | None
+    rain_day_in: float | None
+    rain_ytd_in: float | None
     rain_in: float | None
     rain_mm: float | None
     battery_ok: int | None
@@ -76,6 +78,15 @@ def _query_latest_row(conn: sqlite3.Connection) -> sqlite3.Row | None:
         """
     )
     return cur.fetchone()
+
+
+def _ensure_weather_columns(conn: sqlite3.Connection) -> None:
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(weather_observations)").fetchall()}
+    if "rain_day_in" not in existing_cols:
+        conn.execute("ALTER TABLE weather_observations ADD COLUMN rain_day_in REAL")
+    if "rain_ytd_in" not in existing_cols:
+        conn.execute("ALTER TABLE weather_observations ADD COLUMN rain_ytd_in REAL")
+    conn.commit()
 
 
 def _query_latest_non_null(conn: sqlite3.Connection, column: str) -> sqlite3.Row | None:
@@ -165,6 +176,8 @@ def _snapshot(conn: sqlite3.Connection) -> WeatherSnapshot:
     humidity_row = _query_latest_non_null(conn, "humidity")
     wind_row = _query_latest_non_null(conn, "wind_avg_mi_h") or _query_latest_non_null(conn, "wind_avg_km_h")
     wind_dir_row = _query_latest_non_null(conn, "wind_dir_deg")
+    rain_day_row = _query_latest_non_null(conn, "rain_day_in")
+    rain_ytd_row = _query_latest_non_null(conn, "rain_ytd_in")
     rain_row = _query_latest_non_null(conn, "rain_in") or _query_latest_non_null(conn, "rain_mm")
 
     generated = _format_pacific(datetime.now(tz=UTC).replace(microsecond=0)) or "--"
@@ -183,6 +196,8 @@ def _snapshot(conn: sqlite3.Connection) -> WeatherSnapshot:
             wind_avg_mi_h=None,
             wind_avg_km_h=None,
             wind_dir_deg=None,
+            rain_day_in=None,
+            rain_ytd_in=None,
             rain_in=None,
             rain_mm=None,
             battery_ok=None,
@@ -210,6 +225,8 @@ def _snapshot(conn: sqlite3.Connection) -> WeatherSnapshot:
         wind_avg_mi_h=_to_float(wind_row["wind_avg_mi_h"]) if wind_row is not None else None,
         wind_avg_km_h=_to_float(wind_row["wind_avg_km_h"]) if wind_row is not None else None,
         wind_dir_deg=_to_float(wind_dir_row["wind_dir_deg"]) if wind_dir_row is not None else None,
+        rain_day_in=_to_float(rain_day_row["rain_day_in"]) if rain_day_row is not None else None,
+        rain_ytd_in=_to_float(rain_ytd_row["rain_ytd_in"]) if rain_ytd_row is not None else None,
         rain_in=_to_float(rain_row["rain_in"]) if rain_row is not None else None,
         rain_mm=_to_float(rain_row["rain_mm"]) if rain_row is not None else None,
         battery_ok=_to_int(latest["battery_ok"]),
@@ -232,6 +249,8 @@ def _recent_rows(conn: sqlite3.Connection, max_rows: int) -> list[dict[str, obje
             wind_avg_mi_h,
             wind_avg_km_h,
             wind_dir_deg,
+            rain_day_in,
+            rain_ytd_in,
             rain_in,
             rain_mm,
             battery_ok
@@ -277,7 +296,9 @@ def _html(snapshot: WeatherSnapshot, recent: list[dict[str, object]], title: str
         ("Humidity", f"{_fmt_number(snapshot.humidity)} %"),
         ("Wind", f"{_fmt_number(snapshot.wind_avg_mi_h)} mph / {_fmt_number(snapshot.wind_avg_km_h)} km/h"),
         ("Wind Direction", f"{_fmt_number(snapshot.wind_dir_deg)} deg ({wind_cardinal})"),
-        ("Rain Total", f"{_fmt_number(snapshot.rain_in, 2)} in / {_fmt_number(snapshot.rain_mm, 2)} mm"),
+        ("Rain Today", f"{_fmt_number(snapshot.rain_day_in, 2)} in"),
+        ("Rain YTD", f"{_fmt_number(snapshot.rain_ytd_in, 2)} in"),
+        ("Rain Counter", f"{_fmt_number(snapshot.rain_in, 2)} in / {_fmt_number(snapshot.rain_mm, 2)} mm"),
         ("Battery", battery),
     ]
 
@@ -291,6 +312,8 @@ def _html(snapshot: WeatherSnapshot, recent: list[dict[str, object]], title: str
             f"<td>{_fmt_number(_to_float(row.get('humidity')))}</td>"
             f"<td>{_fmt_number(_to_float(row.get('wind_avg_mi_h')))}</td>"
             f"<td>{_fmt_number(_to_float(row.get('wind_dir_deg')))}</td>"
+            f"<td>{_fmt_number(_to_float(row.get('rain_day_in')), 2)}</td>"
+            f"<td>{_fmt_number(_to_float(row.get('rain_ytd_in')), 2)}</td>"
             f"<td>{_fmt_number(_to_float(row.get('rain_in')), 2)}</td>"
             "</tr>"
         )
@@ -417,11 +440,13 @@ def _html(snapshot: WeatherSnapshot, recent: list[dict[str, object]], title: str
               <th>Humidity %</th>
               <th>Wind mph</th>
               <th>Direction deg</th>
+                            <th>Rain Day in</th>
+                            <th>Rain YTD in</th>
               <th>Rain in</th>
             </tr>
           </thead>
           <tbody>
-            {''.join(row_html) if row_html else '<tr><td colspan="7">No observations yet.</td></tr>'}
+                        {''.join(row_html) if row_html else '<tr><td colspan="9">No observations yet.</td></tr>'}
           </tbody>
         </table>
       </div>
@@ -444,6 +469,7 @@ def build_site(db_path: Path, site_dir: Path, title: str, station_label: str, ma
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
+        _ensure_weather_columns(conn)
         snapshot = _snapshot(conn)
         recent = _recent_rows(conn, max_rows=max_rows)
     finally:

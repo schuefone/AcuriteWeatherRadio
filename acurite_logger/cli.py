@@ -9,12 +9,16 @@ import sqlite3
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 
 DEFAULT_PROTOCOLS = (10, 11, 40, 41, 55, 74, 163, 197)
+PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
+CALIBRATION_YEAR = 2026
+CALIBRATION_YTD_IN = 8.05
 
 
 @dataclass
@@ -32,6 +36,8 @@ class Observation:
     wind_dir_deg: float | None
     rain_mm: float | None
     rain_in: float | None
+    rain_day_in: float | None
+    rain_ytd_in: float | None
     battery_ok: int | None
     message_type: str | None
     raw_json: str
@@ -59,13 +65,133 @@ class WeatherDatabase:
                 wind_dir_deg REAL,
                 rain_mm REAL,
                 rain_in REAL,
+                rain_day_in REAL,
+                rain_ytd_in REAL,
                 battery_ok INTEGER,
                 message_type TEXT,
                 raw_json TEXT NOT NULL
             )
             """
         )
+        self._ensure_observation_columns()
+        self._ensure_rain_tracking_tables()
         self.connection.commit()
+
+    def _ensure_observation_columns(self) -> None:
+        existing_cols = {
+            row[1]
+            for row in self.connection.execute("PRAGMA table_info(weather_observations)").fetchall()
+        }
+        if "rain_day_in" not in existing_cols:
+            self.connection.execute(
+                "ALTER TABLE weather_observations ADD COLUMN rain_day_in REAL"
+            )
+        if "rain_ytd_in" not in existing_cols:
+            self.connection.execute(
+                "ALTER TABLE weather_observations ADD COLUMN rain_ytd_in REAL"
+            )
+
+    def _ensure_rain_tracking_tables(self) -> None:
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rain_calibration (
+                year INTEGER PRIMARY KEY,
+                offset_in REAL NOT NULL,
+                calibrated_at TEXT NOT NULL,
+                note TEXT
+            )
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rain_daily_baseline (
+                date_local TEXT PRIMARY KEY,
+                baseline_ytd_in REAL NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+    def _parse_observed_at_utc(self, observed_at: str) -> datetime:
+        parsed = datetime.fromisoformat(observed_at)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+
+    def _local_date_and_year(self, observed_at: str) -> tuple[str, int]:
+        try:
+            ts_utc = self._parse_observed_at_utc(observed_at)
+        except ValueError:
+            ts_utc = datetime.now(tz=UTC)
+        ts_local = ts_utc.astimezone(PACIFIC_TZ)
+        return ts_local.date().isoformat(), ts_local.year
+
+    def _get_or_create_calibration(self, year: int, rain_in: float, observed_at: str) -> float:
+        row = self.connection.execute(
+            "SELECT offset_in FROM rain_calibration WHERE year = ?",
+            (year,),
+        ).fetchone()
+        if row is not None:
+            return float(row[0])
+
+        if year == CALIBRATION_YEAR:
+            offset = CALIBRATION_YTD_IN - rain_in
+            note = f"Calibrated from known display YTD={CALIBRATION_YTD_IN} in"
+        else:
+            offset = -rain_in
+            note = "Initialized with zero YTD at first seen packet for year"
+
+        self.connection.execute(
+            """
+            INSERT INTO rain_calibration (year, offset_in, calibrated_at, note)
+            VALUES (?, ?, ?, ?)
+            """,
+            (year, offset, observed_at, note),
+        )
+        self.connection.commit()
+        return offset
+
+    def _get_or_create_daily_baseline(
+        self, date_local: str, ytd_in: float, observed_at: str
+    ) -> float:
+        row = self.connection.execute(
+            "SELECT baseline_ytd_in FROM rain_daily_baseline WHERE date_local = ?",
+            (date_local,),
+        ).fetchone()
+        if row is not None:
+            return float(row[0])
+
+        self.connection.execute(
+            """
+            INSERT INTO rain_daily_baseline (date_local, baseline_ytd_in, updated_at)
+            VALUES (?, ?, ?)
+            """,
+            (date_local, ytd_in, observed_at),
+        )
+        self.connection.commit()
+        return ytd_in
+
+    def apply_rain_totals(self, observation: Observation) -> Observation:
+        if observation.rain_in is None:
+            return observation
+
+        date_local, year = self._local_date_and_year(observation.observed_at)
+        offset = self._get_or_create_calibration(
+            year=year,
+            rain_in=observation.rain_in,
+            observed_at=observation.observed_at,
+        )
+        rain_ytd_in = max(0.0, observation.rain_in + offset)
+        baseline = self._get_or_create_daily_baseline(
+            date_local=date_local,
+            ytd_in=rain_ytd_in,
+            observed_at=observation.observed_at,
+        )
+        rain_day_in = max(0.0, rain_ytd_in - baseline)
+
+        observation.rain_ytd_in = round(rain_ytd_in, 3)
+        observation.rain_day_in = round(rain_day_in, 3)
+        return observation
 
     def insert(self, observation: Observation) -> None:
         self.connection.execute(
@@ -84,10 +210,12 @@ class WeatherDatabase:
                 wind_dir_deg,
                 rain_mm,
                 rain_in,
+                rain_day_in,
+                rain_ytd_in,
                 battery_ok,
                 message_type,
                 raw_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 observation.observed_at,
@@ -103,6 +231,8 @@ class WeatherDatabase:
                 observation.wind_dir_deg,
                 observation.rain_mm,
                 observation.rain_in,
+                observation.rain_day_in,
+                observation.rain_ytd_in,
                 observation.battery_ok,
                 observation.message_type,
                 observation.raw_json,
@@ -265,6 +395,8 @@ def normalize_observation(payload: dict[str, Any]) -> Observation:
         wind_dir_deg=wind_dir_deg,
         rain_mm=rain_mm,
         rain_in=rain_in,
+        rain_day_in=None,
+        rain_ytd_in=None,
         battery_ok=safe_int_bool(pick_first(payload, "battery_ok", "battery")),
         message_type=str(message_type) if message_type is not None else None,
         raw_json=json.dumps(payload, sort_keys=True),
@@ -348,6 +480,7 @@ def stream_events(args: argparse.Namespace) -> int:
                 continue
 
             observation = normalize_observation(payload)
+            observation = db.apply_rain_totals(observation)
             db.insert(observation)
             if csv_logger is not None:
                 csv_logger.append(observation)
