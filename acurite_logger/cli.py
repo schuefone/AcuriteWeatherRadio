@@ -175,23 +175,63 @@ class WeatherDatabase:
         if observation.rain_in is None:
             return observation
 
-        date_local, year = self._local_date_and_year(observation.observed_at)
-        offset = self._get_or_create_calibration(
-            year=year,
+        rain_day_in, rain_ytd_in = self._compute_rain_totals(
+            observed_at=observation.observed_at,
             rain_in=observation.rain_in,
-            observed_at=observation.observed_at,
         )
-        rain_ytd_in = max(0.0, observation.rain_in + offset)
-        baseline = self._get_or_create_daily_baseline(
-            date_local=date_local,
-            ytd_in=rain_ytd_in,
-            observed_at=observation.observed_at,
-        )
-        rain_day_in = max(0.0, rain_ytd_in - baseline)
 
         observation.rain_ytd_in = round(rain_ytd_in, 3)
         observation.rain_day_in = round(rain_day_in, 3)
         return observation
+
+    def _compute_rain_totals(self, observed_at: str, rain_in: float) -> tuple[float, float]:
+        date_local, year = self._local_date_and_year(observed_at)
+        offset = self._get_or_create_calibration(
+            year=year,
+            rain_in=rain_in,
+            observed_at=observed_at,
+        )
+        rain_ytd_in = max(0.0, rain_in + offset)
+        baseline = self._get_or_create_daily_baseline(
+            date_local=date_local,
+            ytd_in=rain_ytd_in,
+            observed_at=observed_at,
+        )
+        rain_day_in = max(0.0, rain_ytd_in - baseline)
+        return rain_day_in, rain_ytd_in
+
+    def backfill_rain_totals(self) -> int:
+        self.connection.execute("DELETE FROM rain_calibration")
+        self.connection.execute("DELETE FROM rain_daily_baseline")
+
+        rows = self.connection.execute(
+            """
+            SELECT id, observed_at, rain_in
+            FROM weather_observations
+            WHERE rain_in IS NOT NULL
+            ORDER BY id ASC
+            """
+        ).fetchall()
+
+        for row in rows:
+            row_id = int(row[0])
+            observed_at = str(row[1])
+            rain_in = float(row[2])
+            rain_day_in, rain_ytd_in = self._compute_rain_totals(
+                observed_at=observed_at,
+                rain_in=rain_in,
+            )
+            self.connection.execute(
+                """
+                UPDATE weather_observations
+                SET rain_day_in = ?, rain_ytd_in = ?
+                WHERE id = ?
+                """,
+                (round(rain_day_in, 3), round(rain_ytd_in, 3), row_id),
+            )
+
+        self.connection.commit()
+        return len(rows)
 
     def insert(self, observation: Observation) -> None:
         self.connection.execute(
@@ -318,6 +358,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="append",
         default=[],
         help="Extra argument to pass through to rtl_433. Repeat as needed.",
+    )
+    parser.add_argument(
+        "--backfill-rain-totals",
+        action="store_true",
+        help=(
+            "Recompute rain_day_in and rain_ytd_in for existing rows in the database "
+            "and exit."
+        ),
     )
     return parser.parse_args(argv)
 
@@ -502,4 +550,14 @@ def stream_events(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+
+    if args.backfill_rain_totals:
+        db = WeatherDatabase(Path(args.db_path))
+        try:
+            updated = db.backfill_rain_totals()
+        finally:
+            db.close()
+        print(f"Backfilled rain totals for {updated} observation rows.")
+        return 0
+
     return stream_events(args)
