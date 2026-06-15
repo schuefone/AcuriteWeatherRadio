@@ -272,7 +272,87 @@ journalctl -u acurite-logger.service -n 50 --no-pager
 journalctl -u weather-publish.service -n 50 --no-pager
 ```
 
-## 10. SDR Claim Conflict Fix (`usb_claim_interface error -6`)
+## 10. Optional Repo Maintenance: Monthly Git History Prune
+
+If you want the generated website repo to stay one commit deep, add this optional monthly prune job. It rewrites the `PleasantStreetWeather` history to a single current-state commit and force-pushes it with lease protection.
+
+Create the prune script:
+
+```bash
+mkdir -p /home/schuelaw/bin
+cat > /home/schuelaw/bin/prune-weather-history.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO="/home/schuelaw/GitHub/PleasantStreetWeather"
+cd "$REPO"
+
+git fetch origin main
+git checkout main
+git reset --hard origin/main
+git clean -fdx
+
+TMP_BRANCH="prune-$(date +%Y%m%d-%H%M%S)"
+git checkout --orphan "$TMP_BRANCH"
+git add -A
+git commit -m "Weather site current state ($(date -u +'%Y-%m-%d %H:%M UTC'))"
+
+git branch -M main
+git push --force-with-lease origin main
+EOF
+chmod +x /home/schuelaw/bin/prune-weather-history.sh
+```
+
+Create the prune service:
+
+```bash
+sudo tee /etc/systemd/system/weather-history-prune.service >/dev/null <<'EOF'
+[Unit]
+Description=Monthly prune of PleasantStreetWeather git history
+
+[Service]
+Type=oneshot
+User=schuelaw
+ExecStartPre=/bin/systemctl stop weather-publish.timer
+ExecStart=/bin/bash /home/schuelaw/bin/prune-weather-history.sh
+ExecStartPost=/bin/systemctl start weather-publish.timer
+EOF
+```
+
+Create the monthly timer:
+
+```bash
+sudo tee /etc/systemd/system/weather-history-prune.timer >/dev/null <<'EOF'
+[Unit]
+Description=Run weather history prune monthly
+
+[Timer]
+OnCalendar=monthly
+Persistent=true
+RandomizedDelaySec=20m
+Unit=weather-history-prune.service
+
+[Install]
+WantedBy=timers.target
+EOF
+```
+
+Enable it:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now weather-history-prune.timer
+systemctl status weather-history-prune.timer --no-pager
+```
+
+Optional manual test:
+
+```bash
+sudo systemctl start weather-history-prune.service
+journalctl -u weather-history-prune.service -n 50 --no-pager
+```
+
+## 11. SDR Claim Conflict Fix (`usb_claim_interface error -6`)
 
 Blacklist conflicting DVB modules:
 
@@ -302,7 +382,7 @@ sudo modprobe -r dvb_usb_rtl28xxu rtl2832_sdr rtl2830 dvb_usb_v2 dvb_core
 sudo systemctl start acurite-logger.service
 ```
 
-## 11. Rebuild Verification Checklist
+## 12. Rebuild Verification Checklist
 
 After any OS reinstall, verify these in order:
 

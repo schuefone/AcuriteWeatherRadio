@@ -39,3 +39,5 @@ cd /home/schuelaw/GitHub/AcuriteWeatherRadio
 If you want to verify the timer or cron job, the relevant command still runs from the logger repo and pushes to `PleasantStreetWeather` every 5 minutes by default.
 
 See [pi_setup.md](pi_setup.md) for the full `systemd` and automation setup.
+
+If you also want the generated repo to be periodically squashed back to a single current-state commit, the monthly prune setup is documented in [pi_setup.md](pi_setup.md) as well.
