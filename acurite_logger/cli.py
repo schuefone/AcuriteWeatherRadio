@@ -13,6 +13,7 @@ from datetime import UTC, datetime, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
+import threading
 
 
 DEFAULT_PROTOCOLS = (10, 11, 40, 41, 55, 74, 163, 197)
@@ -43,6 +44,89 @@ class Observation:
     raw_json: str
 
 
+@dataclass
+class ObservationState:
+    observed_at: str | None = None
+    protocol: int | None = None
+    model: str | None = None
+    sensor_id: str | None = None
+    channel: str | None = None
+    temperature_c: float | None = None
+    temperature_f: float | None = None
+    humidity: float | None = None
+    wind_avg_km_h: float | None = None
+    wind_avg_mi_h: float | None = None
+    wind_dir_deg: float | None = None
+    rain_mm: float | None = None
+    rain_in: float | None = None
+    rain_day_in: float | None = None
+    rain_ytd_in: float | None = None
+    battery_ok: int | None = None
+    message_type: str | None = None
+    raw_json: str | None = None
+
+    def __post_init__(self) -> None:
+        self._lock = threading.Lock()
+
+    def has_data(self) -> bool:
+        with self._lock:
+            return any(
+                value is not None
+                for field_name, value in asdict(self).items()
+                if field_name != "raw_json"
+            )
+
+    def merge(self, observation: Observation) -> None:
+        with self._lock:
+            for field_name, value in asdict(observation).items():
+                if value is not None:
+                    setattr(self, field_name, value)
+
+    def build_snapshot(self, snapshot_at: str) -> Observation | None:
+        with self._lock:
+            if not any(
+                value is not None
+                for field_name, value in asdict(self).items()
+                if field_name != "raw_json"
+            ):
+                return None
+
+            state_payload = {
+                key: value
+                for key, value in asdict(self).items()
+                if key != "raw_json"
+            }
+            raw_json = json.dumps(
+                {
+                    "snapshot_at": snapshot_at,
+                    "latest_packet_at": self.observed_at,
+                    "state": state_payload,
+                    "latest_packet_raw": self.raw_json,
+                },
+                sort_keys=True,
+            )
+            return Observation(
+                observed_at=snapshot_at,
+                protocol=self.protocol,
+                model=self.model,
+                sensor_id=self.sensor_id,
+                channel=self.channel,
+                temperature_c=self.temperature_c,
+                temperature_f=self.temperature_f,
+                humidity=self.humidity,
+                wind_avg_km_h=self.wind_avg_km_h,
+                wind_avg_mi_h=self.wind_avg_mi_h,
+                wind_dir_deg=self.wind_dir_deg,
+                rain_mm=self.rain_mm,
+                rain_in=self.rain_in,
+                rain_day_in=self.rain_day_in,
+                rain_ytd_in=self.rain_ytd_in,
+                battery_ok=self.battery_ok,
+                message_type=self.message_type,
+                raw_json=raw_json,
+            )
+
+
 class WeatherDatabase:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
@@ -51,6 +135,31 @@ class WeatherDatabase:
         self.connection.execute(
             """
             CREATE TABLE IF NOT EXISTS weather_observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                observed_at TEXT NOT NULL,
+                protocol INTEGER,
+                model TEXT,
+                sensor_id TEXT,
+                channel TEXT,
+                temperature_c REAL,
+                temperature_f REAL,
+                humidity REAL,
+                wind_avg_km_h REAL,
+                wind_avg_mi_h REAL,
+                wind_dir_deg REAL,
+                rain_mm REAL,
+                rain_in REAL,
+                rain_day_in REAL,
+                rain_ytd_in REAL,
+                battery_ok INTEGER,
+                message_type TEXT,
+                raw_json TEXT NOT NULL
+            )
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS weather_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 observed_at TEXT NOT NULL,
                 protocol INTEGER,
@@ -280,6 +389,53 @@ class WeatherDatabase:
         )
         self.connection.commit()
 
+    def insert_snapshot(self, observation: Observation) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO weather_snapshots (
+                observed_at,
+                protocol,
+                model,
+                sensor_id,
+                channel,
+                temperature_c,
+                temperature_f,
+                humidity,
+                wind_avg_km_h,
+                wind_avg_mi_h,
+                wind_dir_deg,
+                rain_mm,
+                rain_in,
+                rain_day_in,
+                rain_ytd_in,
+                battery_ok,
+                message_type,
+                raw_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                observation.observed_at,
+                observation.protocol,
+                observation.model,
+                observation.sensor_id,
+                observation.channel,
+                observation.temperature_c,
+                observation.temperature_f,
+                observation.humidity,
+                observation.wind_avg_km_h,
+                observation.wind_avg_mi_h,
+                observation.wind_dir_deg,
+                observation.rain_mm,
+                observation.rain_in,
+                observation.rain_day_in,
+                observation.rain_ytd_in,
+                observation.battery_ok,
+                observation.message_type,
+                observation.raw_json,
+            ),
+        )
+        self.connection.commit()
+
     def close(self) -> None:
         self.connection.close()
 
@@ -366,6 +522,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Recompute rain_day_in and rain_ytd_in for existing rows in the database "
             "and exit."
         ),
+    )
+    parser.add_argument(
+        "--snapshot-interval-seconds",
+        type=int,
+        default=300,
+        help="Seconds between merged snapshot writes to the snapshot table.",
     )
     return parser.parse_args(argv)
 
@@ -475,6 +637,33 @@ def build_rtl433_command(args: argparse.Namespace) -> list[str]:
     return command
 
 
+def _build_snapshot(db: WeatherDatabase, state: ObservationState) -> Observation | None:
+    snapshot_at = datetime.now(tz=UTC).replace(microsecond=0).isoformat()
+    snapshot = state.build_snapshot(snapshot_at)
+    if snapshot is None:
+        return None
+    snapshot = db.apply_rain_totals(snapshot)
+    db.insert_snapshot(snapshot)
+    return snapshot
+
+
+def _snapshot_writer_loop(
+    stop_event: threading.Event,
+    db_path: Path,
+    state: ObservationState,
+    interval_seconds: int,
+) -> None:
+    db = WeatherDatabase(db_path)
+    try:
+        while not stop_event.wait(interval_seconds):
+            try:
+                _build_snapshot(db, state)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                print(f"Snapshot write failed: {exc}", file=sys.stderr)
+    finally:
+        db.close()
+
+
 def resolve_executable(path_or_name: str) -> str | None:
     explicit_path = Path(path_or_name)
     if explicit_path.exists():
@@ -491,8 +680,18 @@ def stream_events(args: argparse.Namespace) -> int:
         )
         return 2
 
-    db = WeatherDatabase(Path(args.db_path))
+    db_path = Path(args.db_path)
+    db = WeatherDatabase(db_path)
     csv_logger = CsvLogger(Path(args.csv_path)) if args.csv_path else None
+    state = ObservationState()
+    stop_event = threading.Event()
+    snapshot_thread = threading.Thread(
+        target=_snapshot_writer_loop,
+        args=(stop_event, db_path, state, args.snapshot_interval_seconds),
+        daemon=True,
+        name="weather-snapshot-writer",
+    )
+    snapshot_thread.start()
     command = build_rtl433_command(args)
     command[0] = executable
 
@@ -530,6 +729,7 @@ def stream_events(args: argparse.Namespace) -> int:
             observation = normalize_observation(payload)
             observation = db.apply_rain_totals(observation)
             db.insert(observation)
+            state.merge(observation)
             if csv_logger is not None:
                 csv_logger.append(observation)
             print(
@@ -537,6 +737,8 @@ def stream_events(args: argparse.Namespace) -> int:
                 flush=True,
             )
     finally:
+        stop_event.set()
+        snapshot_thread.join(timeout=5)
         if process.poll() is None:
             process.terminate()
             try:

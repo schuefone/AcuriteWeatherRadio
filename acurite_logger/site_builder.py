@@ -69,15 +69,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _query_latest_row(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    table_name = _observation_table_name(conn)
     cur = conn.execute(
-        """
+        f"""
         SELECT *
-        FROM weather_observations
+        FROM {table_name}
         ORDER BY id DESC
         LIMIT 1
         """
     )
     return cur.fetchone()
+
+
+def _observation_table_name(conn: sqlite3.Connection) -> str:
+    try:
+        snapshot_count = conn.execute("SELECT COUNT(*) FROM weather_snapshots").fetchone()[0]
+    except sqlite3.OperationalError:
+        return "weather_observations"
+    return "weather_snapshots" if snapshot_count else "weather_observations"
 
 
 def _ensure_weather_columns(conn: sqlite3.Connection) -> None:
@@ -90,10 +99,11 @@ def _ensure_weather_columns(conn: sqlite3.Connection) -> None:
 
 
 def _query_latest_non_null(conn: sqlite3.Connection, column: str) -> sqlite3.Row | None:
+    table_name = _observation_table_name(conn)
     cur = conn.execute(
         f"""
         SELECT *
-        FROM weather_observations
+        FROM {table_name}
         WHERE {column} IS NOT NULL
         ORDER BY id DESC
         LIMIT 1
@@ -235,8 +245,9 @@ def _snapshot(conn: sqlite3.Connection) -> WeatherSnapshot:
 
 
 def _recent_rows(conn: sqlite3.Connection, max_rows: int) -> list[dict[str, object]]:
+    table_name = _observation_table_name(conn)
     cur = conn.execute(
-        """
+        f"""
         SELECT
             observed_at,
             model,
@@ -254,7 +265,7 @@ def _recent_rows(conn: sqlite3.Connection, max_rows: int) -> list[dict[str, obje
             rain_in,
             rain_mm,
             battery_ok
-        FROM weather_observations
+        FROM {table_name}
         ORDER BY id DESC
         LIMIT 300
         """

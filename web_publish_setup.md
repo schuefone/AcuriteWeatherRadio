@@ -1,118 +1,41 @@
-# Publish Static Weather Page From Raspberry Pi
+# Publish Static Weather Page
 
-This guide matches your folder layout on the Pi:
+This is the short operational note for the publish side of the project.
 
-- `/home/schuelaw/GitHub/AcuriteWeatherRadio`
-- `/home/schuelaw/GitHub/PleasantStreetWeather`
+The full rebuild and setup flow now lives in [pi_setup.md](pi_setup.md).
 
-The flow is:
+Use this file only for the GitHub Pages-specific details that are distinct from the logger and reboot setup.
 
-1. logger writes to `AcuriteWeatherRadio/data/weather.db`
-2. static page generator reads that DB
-3. generated files are written to `PleasantStreetWeather/index.html` and `PleasantStreetWeather/data.json`
-4. commit and push updates to GitHub Pages repo
+## GitHub Pages Settings
 
-## 1. Verify GitHub Pages Settings
-
-In your `PleasantStreetWeather` repository settings:
+In the `PleasantStreetWeather` repository settings:
 
 - Source: `Deploy from a branch`
 - Branch: `main`
 - Folder: `/(root)`
 
-## 2. Commit New Generator Files In Logger Repo
+## Publish Flow
 
-On the Pi:
+The page generator reads merged snapshot rows from `weather_snapshots` when available, so the site shows one complete row per interval instead of alternating raw bursts.
 
-```bash
-cd /home/schuelaw/GitHub/AcuriteWeatherRadio
-git pull
-```
+The logger repo is responsible for:
 
-You should have these files:
+1. writing raw packets to `weather_observations`
+2. writing merged 5-minute snapshots to `weather_snapshots`
+3. generating `index.html` and `data.json`
+4. committing and pushing updates to the `PleasantStreetWeather` repo
 
-- `acurite_logger/site_builder.py`
-- `scripts/publish_static_weather.sh`
-- `web_publish_setup.md`
+## Manual Publish
 
-## 3. Quick One-Time Static Page Build Test
-
-Activate Conda env first:
-
-```bash
-conda activate weather
-```
-
-Then run:
+From the logger repo on the Pi:
 
 ```bash
 cd /home/schuelaw/GitHub/AcuriteWeatherRadio
-python -m acurite_logger.site_builder \
-  --db-path data/weather.db \
-  --site-dir ../PleasantStreetWeather \
-  --title "Pleasant Street Weather" \
-  --station-label "Pleasant Street Outdoor Sensor"
-```
-
-Verify files were created in the web repo:
-
-```bash
-cd /home/schuelaw/GitHub/PleasantStreetWeather
-ls -l index.html data.json
-```
-
-## 4. Publish Manually
-
-From logger repo:
-
-```bash
-cd /home/schuelaw/GitHub/AcuriteWeatherRadio
-chmod +x scripts/publish_static_weather.sh
 ./scripts/publish_static_weather.sh
 ```
 
-That command will:
+## Timed Publish
 
-- generate `index.html` and `data.json`
-- commit if files changed
-- push to GitHub
+If you want to verify the timer or cron job, the relevant command still runs from the logger repo and pushes to `PleasantStreetWeather` every 5 minutes by default.
 
-## 5. Automate Every 5 Minutes With Cron
-
-Edit crontab:
-
-```bash
-crontab -e
-```
-
-Add this line:
-
-```cron
-*/5 * * * * /bin/bash -lc 'source /home/schuelaw/miniconda3/etc/profile.d/conda.sh; conda activate weather; cd /home/schuelaw/GitHub/AcuriteWeatherRadio; ./scripts/publish_static_weather.sh >> /home/schuelaw/GitHub/AcuriteWeatherRadio/logs/publish.log 2>&1'
-```
-
-If your Miniconda install path is different, update the `source` path accordingly.
-
-## 6. First External Access Test
-
-After the first publish completes, open:
-
-```text
-https://<your-github-username>.github.io/PleasantStreetWeather/
-```
-
-The page may take a minute or two after initial settings change.
-
-## 7. Helpful Checks
-
-Tail cron publish log:
-
-```bash
-tail -f /home/schuelaw/GitHub/AcuriteWeatherRadio/logs/publish.log
-```
-
-Check latest weather rows in SQLite:
-
-```bash
-sqlite3 /home/schuelaw/GitHub/AcuriteWeatherRadio/data/weather.db "select observed_at, model, temperature_f, humidity, wind_avg_mi_h, rain_in from weather_observations order by id desc limit 10;"
-```
+See [pi_setup.md](pi_setup.md) for the full `systemd` and automation setup.

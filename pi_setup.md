@@ -2,6 +2,8 @@
 
 This is the full rebuild checklist for a clean Raspberry Pi OS install.
 
+Use this as the primary setup document. The shorter [web_publish_setup.md](web_publish_setup.md) note is just a publish-side reference and should not duplicate the rebuild steps.
+
 It covers:
 
 1. weather logger setup (`AcuriteWeatherRadio`)
@@ -142,6 +144,13 @@ git config --global user.email "schuelaw@whitman.edu"
 
 ## 7. First Logger Run And Data Check
 
+The logger now does two things at once:
+
+1. stores raw packets in `weather_observations`
+2. writes merged 5-minute snapshots into `weather_snapshots`
+
+The snapshot interval defaults to 300 seconds. If you ever want to change it, pass `--snapshot-interval-seconds` to the logger command or systemd unit.
+
 Quick RF test:
 
 ```bash
@@ -161,6 +170,7 @@ Check database:
 ```bash
 sqlite3 /home/schuelaw/GitHub/AcuriteWeatherRadio/data/weather.db ".tables"
 sqlite3 /home/schuelaw/GitHub/AcuriteWeatherRadio/data/weather.db "select observed_at, model, temperature_f, humidity, wind_avg_mi_h, rain_in from weather_observations order by id desc limit 10;"
+sqlite3 /home/schuelaw/GitHub/AcuriteWeatherRadio/data/weather.db "select observed_at, model, temperature_f, humidity, wind_avg_mi_h, rain_day_in, rain_ytd_in from weather_snapshots order by id desc limit 10;"
 ```
 
 ## 8. First Static Publish Test
