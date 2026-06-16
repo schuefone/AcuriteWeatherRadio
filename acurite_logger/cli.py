@@ -20,6 +20,7 @@ DEFAULT_PROTOCOLS = (10, 11, 40, 41, 55, 74, 163, 197)
 PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
 CALIBRATION_YEAR = 2026
 CALIBRATION_YTD_IN = 8.05
+MAX_RAIN_DELTA_PER_PACKET_IN = 0.2
 
 
 @dataclass
@@ -203,11 +204,11 @@ class WeatherDatabase:
     def _ensure_rain_tracking_tables(self) -> None:
         self.connection.execute(
             """
-            CREATE TABLE IF NOT EXISTS rain_calibration (
+            CREATE TABLE IF NOT EXISTS rain_rollup_state (
                 year INTEGER PRIMARY KEY,
-                offset_in REAL NOT NULL,
-                calibrated_at TEXT NOT NULL,
-                note TEXT
+                last_rain_in REAL,
+                last_ytd_in REAL NOT NULL,
+                updated_at TEXT NOT NULL
             )
             """
         )
@@ -235,30 +236,36 @@ class WeatherDatabase:
         ts_local = ts_utc.astimezone(PACIFIC_TZ)
         return ts_local.date().isoformat(), ts_local.year
 
-    def _get_or_create_calibration(self, year: int, rain_in: float, observed_at: str) -> float:
+    def _get_or_create_rollup_state(self, year: int, observed_at: str) -> tuple[float | None, float]:
         row = self.connection.execute(
-            "SELECT offset_in FROM rain_calibration WHERE year = ?",
+            "SELECT last_rain_in, last_ytd_in FROM rain_rollup_state WHERE year = ?",
             (year,),
         ).fetchone()
         if row is not None:
-            return float(row[0])
+            return _to_float_or_none(row[0]), float(row[1])
 
-        if year == CALIBRATION_YEAR:
-            offset = CALIBRATION_YTD_IN - rain_in
-            note = f"Calibrated from known display YTD={CALIBRATION_YTD_IN} in"
-        else:
-            offset = -rain_in
-            note = "Initialized with zero YTD at first seen packet for year"
+        initial_ytd = CALIBRATION_YTD_IN if year == CALIBRATION_YEAR else 0.0
 
         self.connection.execute(
             """
-            INSERT INTO rain_calibration (year, offset_in, calibrated_at, note)
+            INSERT INTO rain_rollup_state (year, last_rain_in, last_ytd_in, updated_at)
             VALUES (?, ?, ?, ?)
             """,
-            (year, offset, observed_at, note),
+            (year, None, initial_ytd, observed_at),
         )
         self.connection.commit()
-        return offset
+        return None, initial_ytd
+
+    def _update_rollup_state(self, year: int, rain_in: float, rain_ytd_in: float, observed_at: str) -> None:
+        self.connection.execute(
+            """
+            UPDATE rain_rollup_state
+            SET last_rain_in = ?, last_ytd_in = ?, updated_at = ?
+            WHERE year = ?
+            """,
+            (rain_in, rain_ytd_in, observed_at, year),
+        )
+        self.connection.commit()
 
     def _get_or_create_daily_baseline(
         self, date_local: str, ytd_in: float, observed_at: str
@@ -280,6 +287,17 @@ class WeatherDatabase:
         self.connection.commit()
         return ytd_in
 
+    def _update_daily_baseline(self, date_local: str, ytd_in: float, observed_at: str) -> None:
+        self.connection.execute(
+            """
+            UPDATE rain_daily_baseline
+            SET baseline_ytd_in = ?, updated_at = ?
+            WHERE date_local = ?
+            """,
+            (ytd_in, observed_at, date_local),
+        )
+        self.connection.commit()
+
     def apply_rain_totals(self, observation: Observation) -> Observation:
         if observation.rain_in is None:
             return observation
@@ -295,30 +313,57 @@ class WeatherDatabase:
 
     def _compute_rain_totals(self, observed_at: str, rain_in: float) -> tuple[float, float]:
         date_local, year = self._local_date_and_year(observed_at)
-        offset = self._get_or_create_calibration(
+        last_rain_in, last_ytd_in = self._get_or_create_rollup_state(
             year=year,
-            rain_in=rain_in,
             observed_at=observed_at,
         )
-        rain_ytd_in = max(0.0, rain_in + offset)
+        if last_rain_in is None:
+            delta_in = 0.0
+        elif rain_in >= last_rain_in:
+            delta_in = rain_in - last_rain_in
+            if delta_in > MAX_RAIN_DELTA_PER_PACKET_IN:
+                # Treat implausibly large single-packet jumps as maintenance disturbance.
+                delta_in = 0.0
+        else:
+            # Sensor counter reset (power cycle/battery pull): keep accumulating by new counter value.
+            delta_in = rain_in
+
+        rain_ytd_in = max(0.0, last_ytd_in + max(0.0, delta_in))
+        self._update_rollup_state(
+            year=year,
+            rain_in=rain_in,
+            rain_ytd_in=rain_ytd_in,
+            observed_at=observed_at,
+        )
+
         baseline = self._get_or_create_daily_baseline(
             date_local=date_local,
             ytd_in=rain_ytd_in,
             observed_at=observed_at,
         )
+        if baseline > rain_ytd_in:
+            baseline = rain_ytd_in
+            self._update_daily_baseline(
+                date_local=date_local,
+                ytd_in=baseline,
+                observed_at=observed_at,
+            )
+
         rain_day_in = max(0.0, rain_ytd_in - baseline)
         return rain_day_in, rain_ytd_in
 
-    def backfill_rain_totals(self) -> int:
-        self.connection.execute("DELETE FROM rain_calibration")
+    def _reset_rain_tracking_state(self) -> None:
+        self.connection.execute("DELETE FROM rain_rollup_state")
         self.connection.execute("DELETE FROM rain_daily_baseline")
+        self.connection.commit()
 
+    def _backfill_table_rain_totals(self, table_name: str) -> int:
         rows = self.connection.execute(
-            """
+            f"""
             SELECT id, observed_at, rain_in
-            FROM weather_observations
+            FROM {table_name}
             WHERE rain_in IS NOT NULL
-            ORDER BY id ASC
+            ORDER BY observed_at ASC, id ASC
             """
         ).fetchall()
 
@@ -331,8 +376,8 @@ class WeatherDatabase:
                 rain_in=rain_in,
             )
             self.connection.execute(
-                """
-                UPDATE weather_observations
+                f"""
+                UPDATE {table_name}
                 SET rain_day_in = ?, rain_ytd_in = ?
                 WHERE id = ?
                 """,
@@ -341,6 +386,14 @@ class WeatherDatabase:
 
         self.connection.commit()
         return len(rows)
+
+    def backfill_rain_totals(self) -> int:
+        total = 0
+        for table_name in ("weather_observations", "weather_snapshots"):
+            self._reset_rain_tracking_state()
+            total += self._backfill_table_rain_totals(table_name)
+        self._reset_rain_tracking_state()
+        return total
 
     def insert(self, observation: Observation) -> None:
         self.connection.execute(
@@ -537,6 +590,15 @@ def now_iso() -> str:
 
 
 def safe_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_float_or_none(value: Any) -> float | None:
     if value is None:
         return None
     try:

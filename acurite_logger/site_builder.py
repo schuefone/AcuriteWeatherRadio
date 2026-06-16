@@ -253,7 +253,6 @@ def _recent_rows(conn: sqlite3.Connection, max_rows: int) -> list[dict[str, obje
             model,
             sensor_id,
             channel,
-            message_type,
             temperature_f,
             temperature_c,
             humidity,
@@ -262,7 +261,6 @@ def _recent_rows(conn: sqlite3.Connection, max_rows: int) -> list[dict[str, obje
             wind_dir_deg,
             rain_day_in,
             rain_ytd_in,
-            rain_in,
             rain_mm,
             battery_ok
         FROM {table_name}
@@ -280,7 +278,6 @@ def _recent_rows(conn: sqlite3.Connection, max_rows: int) -> list[dict[str, obje
             row["model"],
             row["sensor_id"],
             row["channel"],
-            row["message_type"],
         )
         if key in seen:
             continue
@@ -318,14 +315,12 @@ def _html(snapshot: WeatherSnapshot, recent: list[dict[str, object]], title: str
         row_html.append(
             "<tr>"
             f"<td>{escape(str(row.get('observed_at', '--')))}</td>"
-            f"<td>{escape(str(row.get('message_type', '--')))}</td>"
             f"<td>{_fmt_number(_to_float(row.get('temperature_f')))}</td>"
             f"<td>{_fmt_number(_to_float(row.get('humidity')))}</td>"
             f"<td>{_fmt_number(_to_float(row.get('wind_avg_mi_h')))}</td>"
             f"<td>{_fmt_number(_to_float(row.get('wind_dir_deg')))}</td>"
             f"<td>{_fmt_number(_to_float(row.get('rain_day_in')), 2)}</td>"
             f"<td>{_fmt_number(_to_float(row.get('rain_ytd_in')), 2)}</td>"
-            f"<td>{_fmt_number(_to_float(row.get('rain_in')), 2)}</td>"
             "</tr>"
         )
 
@@ -446,25 +441,23 @@ def _html(snapshot: WeatherSnapshot, recent: list[dict[str, object]], title: str
           <thead>
             <tr>
               <th>Observed</th>
-              <th>Type</th>
               <th>Temp F</th>
               <th>Humidity %</th>
               <th>Wind mph</th>
               <th>Direction deg</th>
                             <th>Rain Day in</th>
                             <th>Rain YTD in</th>
-              <th>Rain in</th>
             </tr>
           </thead>
           <tbody>
-                        {''.join(row_html) if row_html else '<tr><td colspan="9">No observations yet.</td></tr>'}
+                        {''.join(row_html) if row_html else '<tr><td colspan="7">No observations yet.</td></tr>'}
           </tbody>
         </table>
       </div>
     </section>
 
     <footer>
-      Auto-refresh is enabled every 5 minutes. Data source: weather_observations table.
+            Auto-refresh is enabled every 5 minutes. Data source: preferred weather_snapshots table with fallback to weather_observations.
     </footer>
   </main>
 </body>
