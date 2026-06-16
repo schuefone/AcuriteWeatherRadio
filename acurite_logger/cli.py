@@ -242,7 +242,21 @@ class WeatherDatabase:
             (year,),
         ).fetchone()
         if row is not None:
-            return _to_float_or_none(row[0]), float(row[1])
+            last_rain_in = _to_float_or_none(row[0])
+            last_ytd_in = float(row[1])
+            if year == CALIBRATION_YEAR and last_ytd_in < CALIBRATION_YTD_IN:
+                # Keep the configured starting YTD floor for the calibration year.
+                last_ytd_in = CALIBRATION_YTD_IN
+                self.connection.execute(
+                    """
+                    UPDATE rain_rollup_state
+                    SET last_ytd_in = ?, updated_at = ?
+                    WHERE year = ?
+                    """,
+                    (last_ytd_in, observed_at, year),
+                )
+                self.connection.commit()
+            return last_rain_in, last_ytd_in
 
         initial_ytd = CALIBRATION_YTD_IN if year == CALIBRATION_YEAR else 0.0
 
@@ -388,12 +402,52 @@ class WeatherDatabase:
         return len(rows)
 
     def backfill_rain_totals(self) -> int:
-        total = 0
-        for table_name in ("weather_observations", "weather_snapshots"):
-            self._reset_rain_tracking_state()
-            total += self._backfill_table_rain_totals(table_name)
         self._reset_rain_tracking_state()
-        return total
+        observation_total = self._backfill_table_rain_totals("weather_observations")
+        snapshot_total = self._backfill_snapshot_rain_totals_from_observations()
+        self._reset_rain_tracking_state()
+        return observation_total + snapshot_total
+
+    def _backfill_snapshot_rain_totals_from_observations(self) -> int:
+        snapshots = self.connection.execute(
+            """
+            SELECT id, observed_at
+            FROM weather_snapshots
+            ORDER BY observed_at ASC, id ASC
+            """
+        ).fetchall()
+
+        updates = 0
+        for snapshot_row in snapshots:
+            snapshot_id = int(snapshot_row[0])
+            observed_at = str(snapshot_row[1])
+            source = self.connection.execute(
+                """
+                SELECT rain_day_in, rain_ytd_in
+                FROM weather_observations
+                WHERE rain_day_in IS NOT NULL
+                  AND rain_ytd_in IS NOT NULL
+                  AND observed_at <= ?
+                ORDER BY observed_at DESC, id DESC
+                LIMIT 1
+                """,
+                (observed_at,),
+            ).fetchone()
+            if source is None:
+                continue
+
+            self.connection.execute(
+                """
+                UPDATE weather_snapshots
+                SET rain_day_in = ?, rain_ytd_in = ?
+                WHERE id = ?
+                """,
+                (round(float(source[0]), 3), round(float(source[1]), 3), snapshot_id),
+            )
+            updates += 1
+
+        self.connection.commit()
+        return updates
 
     def insert(self, observation: Observation) -> None:
         self.connection.execute(
@@ -704,7 +758,6 @@ def _build_snapshot(db: WeatherDatabase, state: ObservationState) -> Observation
     snapshot = state.build_snapshot(snapshot_at)
     if snapshot is None:
         return None
-    snapshot = db.apply_rain_totals(snapshot)
     db.insert_snapshot(snapshot)
     return snapshot
 
@@ -821,7 +874,7 @@ def main(argv: list[str] | None = None) -> int:
             updated = db.backfill_rain_totals()
         finally:
             db.close()
-        print(f"Backfilled rain totals for {updated} observation rows.")
+        print(f"Backfilled rain totals for {updated} rows across observations and snapshots.")
         return 0
 
     return stream_events(args)
