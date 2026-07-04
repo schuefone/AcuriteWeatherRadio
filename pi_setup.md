@@ -92,11 +92,14 @@ python -m acurite_logger.site_builder --help
 
 ## 5. Configure GitHub Pages
 
-In the `PleasantStreetWeather` GitHub repo settings:
+The live Pages site is deployed from the `PleasantStreetWeather` repository. Keep the current Pi push flow, but switch that repository from branch-based Pages deployment to GitHub Actions so new deploys can cancel older in-progress deploys.
 
-1. Source: `Deploy from a branch`
-2. Branch: `main`
-3. Folder: `/(root)`
+In the `PleasantStreetWeather` repository:
+
+1. Create `.github/workflows/deploy.yml` using the exact workflow shown in `web_publish_setup.md`.
+2. In repository settings, set `Pages -> Source` to `GitHub Actions`.
+
+Do not add this workflow to `AcuriteWeatherRadio` unless you also change the architecture so this repository becomes the one that receives and deploys the generated site files.
 
 ## 6. Configure Git Auth For Unattended Pushes
 
